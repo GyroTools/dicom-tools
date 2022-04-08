@@ -1,18 +1,24 @@
 import errno
 import shutil
 import logging
+import tempfile
+
 import pandas as pd
 import pydicom as dicom
 from pathlib import Path
 from itertools import islice
 from datetime import datetime
 from collections import defaultdict
+
+from gtagora import Agora
+from gtagora.models.dataset import DatasetType
+
 from ._utils import (check_in_dir,
                      ensure_out_dir,
                      create_progress_bar)
 
 _NA = "N/A"
-_DICOM_SUFFIX = ".dcm"
+_DICOM_SUFFIX = ""
 _LOGGER_ID = "dicom"
 _logger = logging.getLogger(_LOGGER_ID)
 
@@ -28,6 +34,15 @@ OptionalFilter = Optional[Callable[[PathLike], bool]]
 class CallablePrinter(Protocol):
     def __call__(self, msg: Optional[str]=None) -> None: ...
 OptionalPrinter = Optional[CallablePrinter]
+
+
+def is_dicom_file(path: Path):
+    if path.is_file():
+        with open(str(path), "rb") as file:
+            file.seek(128)
+            magic = file.read(4)
+            return magic == b'DICM'
+    return False
 
 
 def copy_from_file(in_dir: PathLike,
@@ -264,28 +279,31 @@ def create_dataset_summary(in_dir: PathLike,
     """
     in_dir = Path(in_dir)
 
-    def _canonical_datetime(date: str, time:str) -> datetime:
-        if len(time.split(".")) > 1:
-            dt = datetime.strptime(date+time,"%Y%m%d%H%M%S.%f")
-        else:
-            dt = datetime.strptime(date+time,"%Y%m%d%H%M%S")
-        return dt
+    def _canonical_datetime(date: str, time:str) -> Optional[datetime]:
+        try:
+            if len(time.split(".")) > 1:
+                dt = datetime.strptime(date+time,"%Y%m%d%H%M%S.%f")
+            else:
+                dt = datetime.strptime(date+time,"%Y%m%d%H%M%S")
+            return dt
+        except:
+            return None
 
     def _extract_time(dataset: dicom.Dataset,
                       dataset_id: str) -> Tuple[datetime, str]:
-        if "AcquisitionDate" in dataset and "AcquisitionTime" in dataset:
+        if "AcquisitionDate" in dataset and dataset.AcquisitionDate and "AcquisitionTime" in dataset and dataset.AcquisitionTime:
             dt = _canonical_datetime(date=dataset.AcquisitionDate,
                                      time=dataset.AcquisitionTime)
             dt_type = "AcquisitionDateTime"
-        elif "StudyDate" in dataset and "StudyTime" in dataset:
+        elif "StudyDate" in dataset and dataset.StudyDate and "StudyTime" in dataset and dataset.StudyTime:
             dt = _canonical_datetime(date=dataset.StudyDate,
                                      time=dataset.StudyTime)
             dt_type = "StudyDateTime"
-        elif "InstanceCreationDate" in dataset and "InstanceCreationTime" in dataset:
+        elif "InstanceCreationDate" in dataset and dataset.InstanceCreationDate and "InstanceCreationTime" in dataset and dataset.InstanceCreationTime:
             dt = _canonical_datetime(date=dataset.InstanceCreationDate,
                                      time=dataset.InstanceCreationTime)
             dt_type = "InstanceCreationDateTime"
-        elif "SeriesDate" in dataset and "SeriesTime" in dataset:
+        elif "SeriesDate" in dataset and dataset.SeriesDate and "SeriesTime" in dataset and dataset.SeriesTime:
             dt = _canonical_datetime(date=dataset.SeriesDate,
                                      time=dataset.SeriesTime)
             dt_type = "SeriesDateTime"
@@ -293,6 +311,12 @@ def create_dataset_summary(in_dir: PathLike,
             _logger.warning("No date tag for dataset: %s", dataset_id)
             dt = datetime.utcfromtimestamp(0)
             dt_type = _NA
+
+        if not dt:
+            _logger.warning("No date tag for dataset: %s", dataset_id)
+            dt = datetime.utcfromtimestamp(0)
+            dt_type = _NA
+
         return dt, dt_type
 
     def _extract_key(dataset: dicom.Dataset,
@@ -312,6 +336,8 @@ def create_dataset_summary(in_dir: PathLike,
     # Assumption: DICOM series are located in distinct folders that
     # contain the files/DICOM instances.
     files = list(sorted(in_dir.glob(glob_expr)))
+    files = [f for f in files if is_dicom_file(f)]
+
     files_per_series = defaultdict(list)
     for f in files:
         series_id = f.parent.name
@@ -389,3 +415,40 @@ def create_dataset_summary(in_dir: PathLike,
     progress.finish()
     _logger.info("Done!")
     return data
+
+
+def create_dataset_summary_for_agora(project_id: int,
+                           agora_url: str,
+                           api_key: str,
+                           show_progress: bool=True) -> pd.DataFrame:
+    """
+    Recursively search for DICOM data in a folder and represent the data
+    as a pandas DataFrame.
+    """
+    agora = Agora.create(agora_url, api_key=api_key)
+    project = agora.get_project(project_id)
+    exams = project.get_exams()
+
+    datafiles = []
+    i = 1
+    for e in exams:
+        print(f'getting files from exam: {e.name} ({i}/{len(exams)})', end='\r')
+        datasets = e.get_datasets(filters={'type': DatasetType.DICOM})
+        datafiles.extend([d.datafiles[0] for d in datasets if d.datafiles])
+        i+=1
+
+    with tempfile.TemporaryDirectory(prefix='agora_summary_') as in_dir:
+        in_dir = Path(in_dir)
+        i = 1
+        for d in datafiles:
+            print(f'downloading dicom file ({i}/{len(datafiles)})', end='\r')
+            target_dir = in_dir / f'{d.id}'
+            download_path = d.download(target_dir)
+            expected_path = target_dir / download_path.name
+            if str(download_path) != str(expected_path):
+                shutil.move(download_path, expected_path)
+            i += 1
+
+        return create_dataset_summary(in_dir, '**/*', show_progress=show_progress)
+
+

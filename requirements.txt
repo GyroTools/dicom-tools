@@ -8,4 +8,5 @@ mypy>=0.700             # For static code analysis
 coverage==5.5
 pytest==6.2.1
 pytest-cov==2.11.1
+gtagora-connector==1.2.5
 # coveralls==2.2.0
